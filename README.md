@@ -47,6 +47,31 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+## 비전 모델 간단 테스트
+
+동일 환경에서 이미지 입력이 가능한 모델을 빠르게 점검하려면 아래 스크립트를 사용합니다.
+
+- `vision_test.py`: 비전 요청 1회를 보내는 간단 테스트
+- `sample_image.png`: 샘플 입력 이미지
+
+주의: 이번 스크립트는 요청 사항에 맞춰 `BASE_URL`을 코드 내부에 하드코딩했습니다.
+
+```bash
+python3 vision_test.py
+```
+
+다른 이미지로 테스트:
+
+```bash
+python3 vision_test.py ./sample_image.png "What is in this image?"
+```
+
+기본 동작:
+
+1. `GET /v1/models`로 첫 번째 모델을 선택
+2. 로컬 이미지 파일을 base64 data URL로 변환
+3. `POST /v1/chat/completions`로 텍스트+이미지 멀티모달 요청
+
 프로그램 시작 시 동작:
 
 1. DB 스키마를 초기화하고 필요한 컬럼을 자동 반영합니다.
