@@ -1,637 +1,354 @@
-#!/usr/bin/env python3
-"""
-Multi-model performance test tool
-- Single test: one streaming request per selected model
-- Multi test: concurrent streaming requests per selected model
-- Results stored in SQLite DB, charts saved as PNG
-"""
-
-import asyncio
-import json
-import logging
+import base64
 import os
-import shutil
-import sqlite3
-import sys
 import time
-import uuid
-from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-import aiohttp
-import matplotlib
-import requests
-import tiktoken
 from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+"""OpenAI 호환 프록시를 대상으로 text/vision/embedding(RAG) 테스트를 수행하는 CLI."""
 
-# Environment
 load_dotenv()
 
-API_KEY = (
-    os.environ.get("API_KEY")
-    or os.environ.get("OPENAI_API_KEY")
-    or os.environ.get("VLLM_API_KEY")
-)
-if not API_KEY:
-    raise ValueError("API key is missing. Set API_KEY (or OPENAI_API_KEY / VLLM_API_KEY) in .env")
-
-BASE_URL = os.environ.get("BASE_URL")
-if not BASE_URL:
-    raise ValueError("BASE_URL is missing in .env")
-
-PROMPT = os.environ.get("BASE_PROMPT", "Hello, how are you?")
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "512"))
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.0"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "180"))
-
-# Paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "results.db")
-RESULT_DIR = os.path.join(BASE_DIR, "result")
-PREV_RESULT_DIR = os.path.join(BASE_DIR, "prev_result")
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-# Tokenizer
-encoding = tiktoken.get_encoding("cl100k_base")
-
-REQUIRED_COLUMNS = {
-    "run_id": "TEXT",
-    "total_requests": "INTEGER DEFAULT 1",
-    "success_requests": "INTEGER DEFAULT 0",
-    "error_requests": "INTEGER DEFAULT 0",
-    "success_rate": "REAL DEFAULT 0",
-    "ttft_p95": "REAL DEFAULT 0",
-    "notes": "TEXT",
-}
+ROOT_DIR = Path(__file__).resolve().parent
+SAMPLE_IMAGE_PATH = ROOT_DIR / "sample.jpg"
+TEXT_MODEL_NAME = "text"
+VISION_MODEL_NAME = "vision"
+EMBEDDING_MODEL_NAME = "text-embedding-nomic-embed-text-v1.5"
 
 
-def sanitize_name(name: str) -> str:
-    return name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+class ConfigError(Exception):
+    """필수 설정값(.env)이 누락되었을 때 발생하는 예외."""
+
+    pass
 
 
-def pctl(values: list[float], percentile: int) -> float:
-    if not values:
-        return 0.0
-    sorted_vals = sorted(values)
-    idx = int(round((percentile / 100) * (len(sorted_vals) - 1)))
-    return float(sorted_vals[idx])
+def get_required_env(key: str) -> str:
+    """비어 있지 않은 환경 변수를 반환하고, 누락 시 예외를 발생시킨다."""
+
+    value = os.getenv(key, "").strip()
+    if not value:
+        raise ConfigError(f"환경 변수 {key} 가 설정되어 있지 않습니다.")
+    return value
 
 
-def archive_existing_result_images() -> None:
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    os.makedirs(PREV_RESULT_DIR, exist_ok=True)
-    png_files = [f for f in os.listdir(RESULT_DIR) if f.lower().endswith(".png")]
-    if not png_files:
-        return
+def ask_input(label: str, allow_empty: bool = False) -> str:
+    """사용자 입력을 받아 반환한다. allow_empty가 False면 빈 입력을 재요청한다."""
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for file_name in png_files:
-        src = os.path.join(RESULT_DIR, file_name)
-        dst_name = f"{timestamp}_{file_name}"
-        dst = os.path.join(PREV_RESULT_DIR, dst_name)
-        shutil.move(src, dst)
-    logger.info("Archived %d previous chart images to prev_result/", len(png_files))
+    while True:
+        value = input(label).strip()
+        if value or allow_empty:
+            return value
+        print("값을 입력해 주세요.")
 
 
-def init_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS test_results (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp        TEXT,
-            run_id           TEXT,
-            test_type        TEXT,
-            model_name       TEXT,
-            concurrency      INTEGER DEFAULT 1,
-            total_requests   INTEGER DEFAULT 1,
-            success_requests INTEGER DEFAULT 0,
-            error_requests   INTEGER DEFAULT 0,
-            success_rate     REAL DEFAULT 0,
-            total_tokens     INTEGER DEFAULT 0,
-            total_duration   REAL DEFAULT 0,
-            ttft             REAL DEFAULT 0,
-            ttft_p95         REAL DEFAULT 0,
-            tps              REAL DEFAULT 0,
-            notes            TEXT
-        )
-        """
+def create_chat_model(model_name: str) -> ChatOpenAI:
+    """텍스트/비전 테스트에 사용하는 Chat 모델 클라이언트를 생성한다."""
+
+    api_key = get_required_env("API_KEY")
+    base_url = get_required_env("BASE_URL")
+    return ChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0,
+        model_kwargs={"stream_options": {"include_usage": True}},
     )
 
-    existing_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(test_results)").fetchall()
-    }
-    for col_name, col_type in REQUIRED_COLUMNS.items():
-        if col_name not in existing_columns:
-            conn.execute(f"ALTER TABLE test_results ADD COLUMN {col_name} {col_type}")
 
-    conn.execute("UPDATE test_results SET run_id = 'legacy' WHERE run_id IS NULL")
-    conn.commit()
-    conn.close()
+def create_embeddings_model(model_name: str) -> OpenAIEmbeddings:
+    """RAG 임베딩 생성에 사용하는 임베딩 클라이언트를 생성한다."""
 
-
-def save_result(
-    run_id: str,
-    test_type: str,
-    model_name: str,
-    concurrency: int,
-    total_requests: int,
-    success_requests: int,
-    total_tokens: int,
-    total_duration: float,
-    ttft: float,
-    ttft_p95: float,
-    tps: float,
-    notes: str = "",
-) -> None:
-    error_requests = max(total_requests - success_requests, 0)
-    success_rate = (success_requests / total_requests * 100.0) if total_requests > 0 else 0.0
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO test_results (
-            timestamp, run_id, test_type, model_name, concurrency,
-            total_requests, success_requests, error_requests, success_rate,
-            total_tokens, total_duration, ttft, ttft_p95, tps, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            datetime.now().isoformat(),
-            run_id,
-            test_type,
-            model_name,
-            concurrency,
-            total_requests,
-            success_requests,
-            error_requests,
-            success_rate,
-            total_tokens,
-            total_duration,
-            ttft,
-            ttft_p95,
-            tps,
-            notes,
-        ),
+    api_key = get_required_env("API_KEY")
+    base_url = get_required_env("BASE_URL")
+    return OpenAIEmbeddings(
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        # OpenAI 호환 서버에서 토큰 배열 입력 비호환 이슈를 피하기 위해
+        # raw text를 그대로 전달하는 경로를 사용한다.
+        check_embedding_ctx_length=False,
     )
-    conn.commit()
-    conn.close()
 
 
-def fetch_models() -> list[str]:
-    url = f"{BASE_URL}/models"
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        models = [m["id"] for m in resp.json().get("data", []) if "id" in m]
-        if not models:
-            logger.error("No models found on server.")
-            sys.exit(1)
-        return models
-    except Exception as exc:
-        logger.error("Failed to fetch model names: %s", exc)
-        sys.exit(1)
+def encode_image_to_data_url(image_path: Path) -> str:
+    """이미지 파일을 base64 Data URL로 인코딩한다."""
+
+    with image_path.open("rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
 
 
-def choose_models(models: list[str]) -> list[str]:
-    print("\nAvailable models")
-    print("-" * 60)
-    for idx, model in enumerate(models, start=1):
-        print(f"  {idx:>2}. {model}")
-    print("-" * 60)
+def _extract_text(chunk: Any) -> str:
+    """스트리밍 청크에서 텍스트만 추출한다."""
 
-    raw = input("Select models (all or comma index, example: 1,3): ").strip().lower()
-    if raw == "all":
-        return models
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
 
-    try:
-        indexes = [int(item.strip()) for item in raw.split(",") if item.strip()]
-        selected = [models[i - 1] for i in indexes if 1 <= i <= len(models)]
-    except ValueError:
-        selected = []
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return "".join(parts)
 
-    unique_selected = list(dict.fromkeys(selected))
-    if not unique_selected:
-        print("Invalid selection. Please try again.")
-    return unique_selected
+    return ""
 
 
-async def send_stream_request(
-    session: aiohttp.ClientSession,
-    model_name: str,
-    request_id: int,
-    stream_to_stdout: bool = False,
-) -> dict:
-    url = f"{BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": PROMPT}],
-        "max_tokens": MAX_TOKENS,
-        "temperature": TEMPERATURE,
-        "stream": True,
-    }
+def _extract_usage(chunk: Any) -> dict[str, int]:
+    """스트리밍 청크에서 토큰 사용량 메타데이터를 추출한다."""
 
-    req_start = time.time()
-    first_token_latency = None
-    tokens_generated = 0
+    usage = getattr(chunk, "usage_metadata", None)
+    if isinstance(usage, dict):
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        if input_tokens or output_tokens:
+            return {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }
 
-    try:
-        async with session.post(url, json=payload, headers=headers) as response:
-            if response.status != 200:
-                body = await response.text()
+    response_metadata = getattr(chunk, "response_metadata", None)
+    if isinstance(response_metadata, dict):
+        token_usage = response_metadata.get("token_usage", {})
+        if isinstance(token_usage, dict):
+            input_tokens = int(token_usage.get("prompt_tokens", 0) or 0)
+            output_tokens = int(token_usage.get("completion_tokens", 0) or 0)
+            if input_tokens or output_tokens:
                 return {
-                    "ok": False,
-                    "error": f"HTTP {response.status}: {body[:200]}",
-                    "tokens": 0,
-                    "ttft": 0.0,
-                    "duration": time.time() - req_start,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
                 }
 
-            async for raw_line in response.content:
-                line = raw_line.decode("utf-8").strip()
-                if not line.startswith("data: ") or line == "data: [DONE]":
-                    continue
-
-                if first_token_latency is None:
-                    first_token_latency = time.time() - req_start
-
-                try:
-                    data = json.loads(line[6:])
-                    content = data["choices"][0]["delta"].get("content", "")
-                except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-                    continue
-
-                if content:
-                    tokens_generated += len(encoding.encode(content))
-                    if stream_to_stdout:
-                        print(content, end="", flush=True)
-
-            duration = time.time() - req_start
-            return {
-                "ok": True,
-                "error": "",
-                "tokens": tokens_generated,
-                "ttft": first_token_latency or 0.0,
-                "duration": duration,
-            }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": f"req#{request_id} failed: {exc}",
-            "tokens": 0,
-            "ttft": 0.0,
-            "duration": time.time() - req_start,
-        }
+    return {}
 
 
-def _save_single_chart(model_name: str, total_tokens: int, total_duration: float, ttft: float, tps: float) -> None:
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    safe = sanitize_name(model_name)
+def _estimate_tokens(text: str) -> int:
+    """usage 정보가 없을 때 사용할 간단한 토큰 추정치(단어 수 기반)."""
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
-    metrics = ["Total Tokens", "Duration (s)", "TTFT (s)", "TPS"]
-    values = [total_tokens, total_duration, ttft, tps]
-    colors = ["#2196F3", "#4CAF50", "#FF9800", "#E91E63"]
-
-    for ax, label, val, color in zip(axes, metrics, values, colors):
-        ax.bar([label], [val], color=color, width=0.5)
-        ax.set_title(label, fontsize=12)
-        fmt = f"{val:.2f}" if isinstance(val, float) else str(val)
-        ax.text(0, val, fmt, ha="center", va="bottom", fontsize=12, fontweight="bold")
-
-    fig.suptitle(f"Single Test - {model_name}", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    path = os.path.join(RESULT_DIR, f"{safe}_single_1.png")
-    plt.savefig(path, dpi=150)
-    plt.close()
-    logger.info("Chart saved: %s", path)
+    if not text.strip():
+        return 0
+    return max(1, len(text.split()))
 
 
-def _save_multi_chart(model_name: str, all_stats: list[dict]) -> None:
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    safe = sanitize_name(model_name)
+def stream_response(llm: ChatOpenAI, messages: list[Any]) -> dict[str, float | int | None]:
+    """모델 응답을 스트리밍 출력하고 핵심 성능 지표를 계산한다."""
 
-    concurrencies = [s["concurrency"] for s in all_stats]
-    tps_vals = [s["system_tps"] for s in all_stats]
-    ttft_p95_vals = [s["ttft_p95"] for s in all_stats]
+    start_time = time.perf_counter()
+    first_token_time: float | None = None
+    output_parts: list[str] = []
+    usage: dict[str, int] = {}
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    print("\n[응답]\n", end="", flush=True)
 
-    ax1.plot(concurrencies, tps_vals, marker="o", color="#1f77b4", linewidth=2, markersize=8)
-    ax1.set_xlabel("Concurrent Requests", fontsize=12)
-    ax1.set_ylabel("System Throughput (tokens/s)", fontsize=12)
-    ax1.set_title("Throughput vs Concurrency", fontsize=13, fontweight="bold")
-    ax1.grid(True, alpha=0.3)
+    for chunk in llm.stream(messages):
+        # 청크별 텍스트를 즉시 출력해 사용자 체감 지연을 줄인다.
+        chunk_text = _extract_text(chunk)
+        if chunk_text and first_token_time is None:
+            first_token_time = time.perf_counter()
 
-    ax2.plot(concurrencies, ttft_p95_vals, marker="s", color="#ff7f0e", linewidth=2, markersize=8)
-    ax2.set_xlabel("Concurrent Requests", fontsize=12)
-    ax2.set_ylabel("TTFT p95 (s)", fontsize=12)
-    ax2.set_title("TTFT p95 vs Concurrency", fontsize=13, fontweight="bold")
-    ax2.grid(True, alpha=0.3)
+        if chunk_text:
+            print(chunk_text, end="", flush=True)
+            output_parts.append(chunk_text)
 
-    fig.suptitle(f"Multi Test - {model_name}", fontsize=14, fontweight="bold")
-    plt.tight_layout()
+        current_usage = _extract_usage(chunk)
+        if current_usage:
+            usage = current_usage
 
-    conc_str = "_".join(str(c) for c in concurrencies)
-    path = os.path.join(RESULT_DIR, f"{safe}_multi_{conc_str}.png")
-    plt.savefig(path, dpi=150)
-    plt.close()
-    logger.info("Chart saved: %s", path)
-
-
-async def single_test(model_name: str, run_id: str) -> None:
-    logger.info("Starting single test | run_id=%s | model=%s", run_id, model_name)
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        result = await send_stream_request(session, model_name, request_id=1, stream_to_stdout=True)
-
+    end_time = time.perf_counter()
     print("\n")
-    if not result["ok"]:
-        logger.error("Single test failed | model=%s | error=%s", model_name, result["error"])
-        save_result(
-            run_id=run_id,
-            test_type="single",
-            model_name=model_name,
-            concurrency=1,
-            total_requests=1,
-            success_requests=0,
-            total_tokens=0,
-            total_duration=result["duration"],
-            ttft=0.0,
-            ttft_p95=0.0,
-            tps=0.0,
-            notes=result["error"],
-        )
+
+    output_text = "".join(output_parts)
+    output_tokens = usage.get("output_tokens", _estimate_tokens(output_text))
+    input_tokens = usage.get("input_tokens", 0)
+
+    if first_token_time is not None:
+        ttft = first_token_time - start_time
+        gen_duration = max(end_time - first_token_time, 1e-9)
+    else:
+        ttft = None
+        gen_duration = max(end_time - start_time, 1e-9)
+
+    tps = output_tokens / gen_duration if output_tokens else 0.0
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "ttft": ttft,
+        "tps": tps,
+    }
+
+
+def print_metrics(metrics: dict[str, float | int | None]) -> None:
+    """응답 후 토큰/지연 관련 메트릭을 보기 좋은 형식으로 출력한다."""
+
+    input_tokens = int(metrics["input_tokens"] or 0)
+    output_tokens = int(metrics["output_tokens"] or 0)
+    ttft = metrics["ttft"]
+    tps = float(metrics["tps"] or 0.0)
+
+    print("[메트릭]")
+    print(f"- 입력 토큰 수: {input_tokens}")
+    print(f"- 출력 토큰 수: {output_tokens}")
+
+    if ttft is None:
+        print("- TTFT: 측정 불가")
+    else:
+        print(f"- TTFT: {ttft:.3f}초")
+
+    print(f"- TPS: {tps:.2f}")
+
+
+def run_text_test() -> None:
+    """메뉴 1: 텍스트 모델 단일 프롬프트 테스트."""
+
+    prompt = ask_input("프롬프트를 입력하세요: ")
+
+    llm = create_chat_model(TEXT_MODEL_NAME)
+    messages = [HumanMessage(content=prompt)]
+    metrics = stream_response(llm, messages)
+    print_metrics(metrics)
+
+
+def run_vision_test() -> None:
+    """메뉴 2: sample.jpg + 프롬프트로 비전 모델 테스트."""
+
+    if not SAMPLE_IMAGE_PATH.exists():
+        print(f"샘플 이미지 파일이 없습니다: {SAMPLE_IMAGE_PATH.name}")
         return
 
-    tps = result["tokens"] / result["duration"] if result["duration"] > 0 else 0.0
-    print("=" * 80)
-    print("Single Test Results")
-    print("=" * 80)
-    print(f"Model               : {model_name}")
-    print(f"Total Tokens        : {result['tokens']}")
-    print(f"Total Duration (s)  : {result['duration']:.2f}")
-    print(f"TTFT (s)            : {result['ttft']:.3f}")
-    print(f"Throughput TPS      : {tps:.2f}")
-    print("=" * 80)
+    prompt = ask_input("이미지에 대한 프롬프트를 입력하세요: ")
 
-    save_result(
-        run_id=run_id,
-        test_type="single",
-        model_name=model_name,
-        concurrency=1,
-        total_requests=1,
-        success_requests=1,
-        total_tokens=result["tokens"],
-        total_duration=result["duration"],
-        ttft=result["ttft"],
-        ttft_p95=result["ttft"],
-        tps=tps,
-        notes="",
-    )
-    _save_single_chart(model_name, result["tokens"], result["duration"], result["ttft"], tps)
+    image_data_url = encode_image_to_data_url(SAMPLE_IMAGE_PATH)
+    llm = create_chat_model(VISION_MODEL_NAME)
 
-
-async def multi_test(model_name: str, concurrency_levels: list[int], run_id: str) -> None:
-    logger.info("Starting multi test | run_id=%s | model=%s", run_id, model_name)
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-
-    all_stats: list[dict] = []
-    for idx, concurrency in enumerate(concurrency_levels, start=1):
-        logger.info("[%d/%d] model=%s concurrency=%d", idx, len(concurrency_levels), model_name, concurrency)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            tasks = [
-                send_stream_request(session, model_name, request_id=req_id, stream_to_stdout=False)
-                for req_id in range(1, concurrency + 1)
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_data_url}},
             ]
-            results = await asyncio.gather(*tasks)
-
-        success_results = [r for r in results if r["ok"]]
-        ttft_vals = [r["ttft"] for r in success_results]
-        duration_vals = [r["duration"] for r in success_results]
-        total_tokens = sum(r["tokens"] for r in success_results)
-
-        total_duration = max(duration_vals) if duration_vals else 0.0
-        avg_ttft = (sum(ttft_vals) / len(ttft_vals)) if ttft_vals else 0.0
-        ttft_p95 = pctl(ttft_vals, 95)
-        system_tps = total_tokens / total_duration if total_duration > 0 else 0.0
-        success_requests = len(success_results)
-        error_requests = concurrency - success_requests
-        success_rate = (success_requests / concurrency * 100.0) if concurrency > 0 else 0.0
-
-        error_sample = ""
-        for item in results:
-            if not item["ok"]:
-                error_sample = item["error"]
-                break
-
-        stats = {
-            "concurrency": concurrency,
-            "total_tokens": total_tokens,
-            "total_duration": round(total_duration, 2),
-            "avg_ttft": round(avg_ttft, 3),
-            "ttft_p95": round(ttft_p95, 3),
-            "system_tps": round(system_tps, 2),
-            "success": success_requests,
-            "error": error_requests,
-            "success_rate": round(success_rate, 1),
-        }
-        all_stats.append(stats)
-
-        save_result(
-            run_id=run_id,
-            test_type="multi",
-            model_name=model_name,
-            concurrency=concurrency,
-            total_requests=concurrency,
-            success_requests=success_requests,
-            total_tokens=total_tokens,
-            total_duration=total_duration,
-            ttft=avg_ttft,
-            ttft_p95=ttft_p95,
-            tps=system_tps,
-            notes=error_sample,
         )
+    ]
 
-        logger.info(
-            "model=%s conc=%d success=%d/%d tps=%.2f ttft_p95=%.3f",
-            model_name,
-            concurrency,
-            success_requests,
-            concurrency,
-            system_tps,
-            ttft_p95,
-        )
-
-        if idx < len(concurrency_levels):
-            await asyncio.sleep(2)
-
-    print("\n" + "=" * 110)
-    print(f"Multi Test Results - Model: {model_name}")
-    print("=" * 110)
-    print(
-        f"{'Conc':>6} | {'Tokens':>8} | {'Dur(s)':>8} | {'TTFT Avg':>9} | "
-        f"{'TTFT p95':>9} | {'TPS':>10} | {'Success':>9} | {'Rate':>7}"
-    )
-    print("-" * 110)
-    for s in all_stats:
-        print(
-            f"{s['concurrency']:>6} | {s['total_tokens']:>8} | {s['total_duration']:>8.2f} | "
-            f"{s['avg_ttft']:>9.3f} | {s['ttft_p95']:>9.3f} | {s['system_tps']:>10.2f} | "
-            f"{s['success']:>4}/{(s['success'] + s['error']):<4} | {s['success_rate']:>6.1f}%"
-        )
-    print("=" * 110)
-
-    _save_multi_chart(model_name, all_stats)
+    metrics = stream_response(llm, messages)
+    print_metrics(metrics)
 
 
-def view_results() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        """
-        SELECT id, timestamp, run_id, test_type, model_name, concurrency,
-               total_requests, success_requests, success_rate,
-               total_tokens, total_duration, ttft, ttft_p95, tps
-        FROM test_results
-        ORDER BY id DESC
-        """
-    ).fetchall()
-    conn.close()
+def load_documents(file_path: Path) -> list[Any]:
+    """입력 파일 확장자에 맞춰 문서를 로딩한다(txt/pdf)."""
 
-    if not rows:
-        print("\nNo results found in database.")
+    suffix = file_path.suffix.lower()
+    if suffix == ".txt":
+        loader = TextLoader(str(file_path), autodetect_encoding=True)
+    elif suffix == ".pdf":
+        loader = PyPDFLoader(str(file_path))
+    else:
+        raise ValueError("지원하지 않는 파일 형식입니다. txt 또는 pdf 파일을 사용하세요.")
+
+    return loader.load()
+
+
+def run_embedding_test() -> None:
+    """메뉴 3: 문서 임베딩 + FAISS 검색 기반 RAG 질의응답 테스트."""
+
+    file_name = ask_input("첨부할 파일명을 입력하세요 (예: sample.txt, sample.pdf): ")
+    file_path = (ROOT_DIR / file_name).resolve()
+
+    if not file_path.exists() or not file_path.is_file():
+        print("입력한 파일을 찾을 수 없습니다.")
         return
 
-    print("\n" + "=" * 160)
-    print("Test Results")
-    print("=" * 160)
-    print(
-        f"{'ID':>4} | {'Timestamp':>19} | {'Run ID':>10} | {'Type':>6} | {'Model':>34} | "
-        f"{'Conc':>4} | {'Req':>7} | {'Succ':>7} | {'Rate':>6} | {'Tokens':>8} | "
-        f"{'Dur(s)':>7} | {'TTFT':>7} | {'P95':>7} | {'TPS':>8}"
-    )
-    print("-" * 160)
-    for row in rows:
-        (
-            rid,
-            ts,
-            run_id,
-            test_type,
-            model_name,
-            concurrency,
-            total_requests,
-            success_requests,
-            success_rate,
-            total_tokens,
-            total_duration,
-            ttft,
-            ttft_p95,
-            tps,
-        ) = row
-        ts_short = (ts or "")[:19]
-        model_short = model_name[-34:] if len(model_name) > 34 else model_name
-        run_short = (run_id or "-")[:10]
+    question = ask_input("질문(프롬프트)을 입력하세요: ")
 
-        print(
-            f"{rid:>4} | {ts_short:>19} | {run_short:>10} | {test_type:>6} | {model_short:>34} | "
-            f"{int(concurrency):>4} | {int(total_requests):>7} | {int(success_requests):>7} | "
-            f"{float(success_rate):>5.1f}% | {int(total_tokens):>8} | {float(total_duration):>7.2f} | "
-            f"{float(ttft):>7.3f} | {float(ttft_p95):>7.3f} | {float(tps):>8.2f}"
-        )
-    print("=" * 160)
+    docs = load_documents(file_path)
+    # 검색 품질과 처리 비용의 균형을 위해 문서를 청크 단위로 분할한다.
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+    split_docs = splitter.split_documents(docs)
+
+    if not split_docs:
+        print("문서에서 처리할 텍스트를 찾을 수 없습니다.")
+        return
+
+    embeddings = create_embeddings_model(EMBEDDING_MODEL_NAME)
+    # 문서 청크를 벡터화해 FAISS 인덱스를 구성한다.
+    vector_store = FAISS.from_documents(split_docs, embeddings)
+    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+
+    retrieved_docs = retriever.invoke(question)
+    context = "\n\n".join(doc.page_content.strip() for doc in retrieved_docs if doc.page_content.strip())
+
+    if not context:
+        print("검색된 문맥이 없어 답변을 생성할 수 없습니다.")
+        return
+
+    llm = create_chat_model(TEXT_MODEL_NAME)
+    messages = [
+        SystemMessage(
+            content=(
+                "당신은 문서 기반 질의응답 도우미입니다. "
+                "제공된 문맥 안에서만 답변하고, 문맥이 부족하면 부족하다고 명시하세요."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"질문:\n{question}\n\n"
+                f"문맥:\n{context}\n\n"
+                "위 문맥을 바탕으로 한국어로 답변해 주세요."
+            )
+        ),
+    ]
+
+    print(f"\n[검색된 문서 조각 수] {len(retrieved_docs)}")
+    metrics = stream_response(llm, messages)
+    print_metrics(metrics)
 
 
-def parse_concurrency_levels(raw: str) -> list[int]:
-    levels = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        try:
-            val = int(chunk)
-        except ValueError:
-            return []
-        if val <= 0:
-            return []
-        levels.append(val)
-    return sorted(list(dict.fromkeys(levels)))
+def print_menu() -> None:
+    """CLI 메인 메뉴를 출력한다."""
+
+    print("\n=== LLM 테스트 메뉴 ===")
+    print("1. text 모델 테스트")
+    print("2. image(vision) 모델 테스트")
+    print("3. embedding 모델 테스트 (RAG)")
+    print("4. 종료")
 
 
 def main() -> None:
-    init_db()
-    archive_existing_result_images()
+    """메뉴 루프를 실행하며 선택한 테스트를 호출한다."""
 
-    print("=" * 60)
-    print("LLM Performance Test Tool")
-    print("=" * 60)
-    print("Fetching model list from server ...")
-    models = fetch_models()
-    print(f"Server  : {BASE_URL}")
-    print(f"Models  : {len(models)} found")
-    print("=" * 60)
+    print("LLM 테스트 프로그램을 시작합니다.")
 
     while True:
-        print("\nMenu")
-        print("  1. Single test")
-        print("  2. Multi test")
-        print("  3. View results")
-        print("  4. Exit")
+        try:
+            print_menu()
+            choice = ask_input("메뉴 번호를 선택하세요: ")
 
-        choice = input("Select [1-4]: ").strip()
+            if choice == "1":
+                run_text_test()
+            elif choice == "2":
+                run_vision_test()
+            elif choice == "3":
+                run_embedding_test()
+            elif choice == "4":
+                print("프로그램을 종료합니다.")
+                break
+            else:
+                print("유효한 메뉴 번호를 입력해 주세요.")
 
-        if choice == "1":
-            selected_models = choose_models(models)
-            if not selected_models:
-                continue
-
-            run_id = uuid.uuid4().hex[:10]
-            print(f"\nStarting single tests | run_id={run_id} | models={len(selected_models)}")
-            for model_name in selected_models:
-                print(f"\n[Single] model={model_name}")
-                asyncio.run(single_test(model_name, run_id=run_id))
-
-        elif choice == "2":
-            selected_models = choose_models(models)
-            if not selected_models:
-                continue
-
-            raw = input("Enter concurrency levels (example: 10, 100, 200): ").strip()
-            levels = parse_concurrency_levels(raw)
-            if not levels:
-                print("Invalid input. Please use comma-separated positive integers.")
-                continue
-
-            run_id = uuid.uuid4().hex[:10]
-            print(
-                f"\nStarting multi tests | run_id={run_id} | models={len(selected_models)} | "
-                f"concurrency={levels}"
-            )
-            for model_name in selected_models:
-                print(f"\n[Multi] model={model_name}")
-                asyncio.run(multi_test(model_name, levels, run_id=run_id))
-
-        elif choice == "3":
-            view_results()
-
-        elif choice == "4":
-            print("Goodbye")
+        except KeyboardInterrupt:
+            print("\n사용자 요청으로 종료합니다.")
             break
-
-        else:
-            print("Invalid selection. Choose a number between 1 and 4.")
+        except ConfigError as e:
+            print(f"설정 오류: {e}")
+        except Exception as e:
+            print(f"오류가 발생했습니다: {e}")
 
 
 if __name__ == "__main__":
