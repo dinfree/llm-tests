@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from langchain_community.retrievers import BM25Retriever
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
@@ -248,11 +249,37 @@ def load_documents(file_path: Path) -> list[Any]:
     if suffix == ".txt":
         loader = TextLoader(str(file_path), autodetect_encoding=True)
     elif suffix == ".pdf":
-        loader = PyPDFLoader(str(file_path))
+        # 표/열 배치가 있는 PDF에서 텍스트 손실을 줄이기 위해 layout 모드를 우선 사용한다.
+        loader = PyPDFLoader(str(file_path), extraction_mode="layout")
     else:
         raise ValueError("지원하지 않는 파일 형식입니다. txt 또는 pdf 파일을 사용하세요.")
 
     return loader.load()
+
+
+def _doc_key(doc: Any) -> str:
+    """문서 조각 중복 제거를 위한 안정 키를 생성한다."""
+
+    source = str(doc.metadata.get("source", ""))
+    page = str(doc.metadata.get("page", ""))
+    start_index = str(doc.metadata.get("start_index", ""))
+    return f"{source}:{page}:{start_index}:{hash(doc.page_content)}"
+
+
+def reciprocal_rank_fusion(rank_lists: list[list[Any]], limit: int = 6, rrf_k: int = 60) -> list[Any]:
+    """여러 검색 결과를 RRF로 융합해 안정적인 상위 문맥을 구성한다."""
+
+    scores: dict[str, float] = {}
+    docs_by_key: dict[str, Any] = {}
+
+    for rank_list in rank_lists:
+        for rank, doc in enumerate(rank_list, start=1):
+            key = _doc_key(doc)
+            docs_by_key[key] = doc
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank)
+
+    fused_keys = sorted(scores.keys(), key=lambda key: scores[key], reverse=True)
+    return [docs_by_key[key] for key in fused_keys[:limit]]
 
 
 def run_embedding_test() -> None:
@@ -268,8 +295,33 @@ def run_embedding_test() -> None:
     question = ask_input("질문(프롬프트)을 입력하세요: ")
 
     docs = load_documents(file_path)
-    # 검색 품질과 처리 비용의 균형을 위해 문서를 청크 단위로 분할한다.
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=120)
+
+    # PDF는 페이지별 텍스트 추출이 비어 있는 경우가 자주 있어 선제적으로 필터링한다.
+    non_empty_docs = [doc for doc in docs if doc.page_content and doc.page_content.strip()]
+    if not non_empty_docs:
+        if file_path.suffix.lower() == ".pdf":
+            print(
+                "PDF에서 텍스트를 추출하지 못했습니다. "
+                "스캔본(이미지 기반) PDF일 가능성이 높습니다."
+            )
+        else:
+            print("문서에서 처리할 텍스트를 찾을 수 없습니다.")
+        return
+
+    if file_path.suffix.lower() == ".pdf" and len(non_empty_docs) < len(docs):
+        print(
+            "[안내] 일부 PDF 페이지에서 텍스트를 추출하지 못했습니다. "
+            "검색 품질이 떨어질 수 있습니다."
+        )
+
+    docs = non_empty_docs
+
+    # 문맥 단절을 줄이기 위해 overlap을 늘리고 start index를 유지한다.
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,
+        chunk_overlap=150,
+        add_start_index=True,
+    )
     split_docs = splitter.split_documents(docs)
 
     if not split_docs:
@@ -279,9 +331,24 @@ def run_embedding_test() -> None:
     embeddings = create_embeddings_model(EMBEDDING_MODEL_NAME)
     # 문서 청크를 벡터화해 FAISS 인덱스를 구성한다.
     vector_store = FAISS.from_documents(split_docs, embeddings)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
-    retrieved_docs = retriever.invoke(question)
+    # dense + sparse 하이브리드 검색으로 고유명사/키워드 누락을 줄인다.
+    dense_retriever = vector_store.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 8, "fetch_k": 24, "lambda_mult": 0.3},
+    )
+    sparse_retriever = BM25Retriever.from_documents(split_docs)
+    sparse_retriever.k = 8
+
+    dense_docs = dense_retriever.invoke(question)
+    sparse_docs = sparse_retriever.invoke(question)
+    retrieved_docs = reciprocal_rank_fusion([dense_docs, sparse_docs], limit=6)
+
+    if file_path.suffix.lower() == ".pdf":
+        print(
+            f"[검색 방식] hybrid(dense={len(dense_docs)} + sparse={len(sparse_docs)} -> final={len(retrieved_docs)})"
+        )
+
     context = "\n\n".join(doc.page_content.strip() for doc in retrieved_docs if doc.page_content.strip())
 
     if not context:

@@ -101,62 +101,67 @@ flowchart TD
 +--------------------+
 |       main         |
 +--------------------+
-       |
-       v
-+--------------------+        +--------------------------+
-|     print_menu     |<-------|    while True loop       |
-+--------------------+        +--------------------------+
-       |
-       v
-+--------------------+
-| ask_input(메뉴선택) |
-+--------------------+
-  |            |             |
-  | 1          | 2           | 3
-  v            v             v
-+-------------------+  +-------------------+  +----------------------+
-|   run_text_test   |  |  run_vision_test  |  |  run_embedding_test  |
-+-------------------+  +-------------------+  +----------------------+
-  |                         |                          |
-  v                         v                          v
-+----------------------+  +-------------------------+  +----------------------+
-| create_chat_model    |  | sample.jpg 존재 확인    |  | load_documents       |
-| (text)               |  +-------------------------+  +----------------------+
-+----------------------+             |                 +----------------------+
-  |                                 v                 | RecursiveCharacter... |
-  v                      +-------------------------+  +----------------------+
-+----------------------+   | encode_image_to_data... |  +----------------------+
-| stream_response      |   +-------------------------+  | create_embeddings... |
-|  - _extract_text     |             |                 +----------------------+
-|  - _extract_usage    |             v                 +----------------------+
-+----------------------+   +-------------------------+  | FAISS.from_documents |
-  |                      | create_chat_model(vision)| +----------------------+
-  v                      +-------------------------+  +----------------------+
-+----------------------+             |                 | retriever.invoke     |
-|   print_metrics      |             v                 +----------------------+
-+----------------------+   +-------------------------+  +----------------------+
-                  |    stream_response      |  | create_chat_model    |
-                  +-------------------------+  | (text, 답변 생성)    |
-                           |               +----------------------+
-                           v                          |
-                  +-------------------------+             v
-                  |      print_metrics      |  +----------------------+
-                  +-------------------------+  |   stream_response     |
-                                      +----------------------+
-                                              |
-                                              v
-                                      +----------------------+
-                                      |    print_metrics     |
-                                      +----------------------+
+          |
+          v
++--------------------+      +--------------------------+
+|     print_menu     |<-----|      while True loop     |
++--------------------+      +--------------------------+
+          |
+          v
++---------------------+
+| ask_input(메뉴 선택) |
++---------------------+
+   | 1                 | 2                   | 3
+   v                   v                     v
++-------------------+ +-------------------+ +----------------------+
+|   run_text_test   | |  run_vision_test  | |  run_embedding_test  |
++-------------------+ +-------------------+ +----------------------+
+| create_chat_model | | sample.jpg 확인   | | load_documents       |
+|   (text)          | | encode_image_to.. | | split_documents      |
+| stream_response   | | create_chat_model | | create_embeddings... |
+|  - _extract_text  | |   (vision)        | | FAISS.from_documents |
+|  - _extract_usage | | stream_response   | | retriever.invoke     |
+| print_metrics     | | print_metrics     | | create_chat_model    |
+|                   | |                   | |   (text)             |
+|                   | |                   | | stream_response      |
+|                   | |                   | | print_metrics        |
++-------------------+ +-------------------+ +----------------------+
 
 공통 의존(환경 변수)
 +------------------------------+
 | get_required_env(API_KEY)    |
 | get_required_env(BASE_URL)   |
 +------------------------------+
-      ^              ^
-      |              |
+        ^               ^
+        |               |
   create_chat_model  create_embeddings_model
+```
+
+## 10) 함수 호출 관계 (한페이지 요약형)
+
+빠르게 구조만 파악할 때 보는 초압축 버전입니다.
+
+```text
++--------------------- LLM Tests CLI ---------------------+
+| main -> print_menu -> ask_input(메뉴)                   |
++---------------------------------------------------------+
+                 |1                     |2                     |3
+                 v                      v                      v
+      +------------------+    +-------------------+    +----------------------+
+      | run_text_test    |    | run_vision_test   |    | run_embedding_test   |
+      +------------------+    +-------------------+    +----------------------+
+      | create_chat_model|    | sample.jpg check  |    | load_documents       |
+      | stream_response  |    | image->data_url   |    | split_documents      |
+      | print_metrics    |    | create_chat_model |    | create_embeddings    |
+      |                  |    | stream_response   |    | FAISS.from_documents |
+      |                  |    | print_metrics     |    | retriever.invoke     |
+      |                  |    |                   |    | create_chat_model    |
+      |                  |    |                   |    | stream_response      |
+      |                  |    |                   |    | print_metrics        |
+      +------------------+    +-------------------+    +----------------------+
+
+공통 의존: get_required_env(API_KEY, BASE_URL)
+공통 출력: stream_response -> _extract_text/_extract_usage -> print_metrics
 ```
 
 
