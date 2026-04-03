@@ -18,8 +18,8 @@ load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
 SAMPLE_IMAGE_PATH = ROOT_DIR / "sample.jpg"
-TEXT_MODEL_NAME = "text"
-VISION_MODEL_NAME = "vision"
+TEXT_MODEL_NAME = "google/gemma-4-26B-A4B"
+VISION_MODEL_NAME = "google/gemma-4-26B-A4B"
 EMBEDDING_MODEL_NAME = "text-embedding-nomic-embed-text-v1.5"
 
 
