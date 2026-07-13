@@ -84,3 +84,6 @@ Thumbs.db
 # OS specific
 Thumbs.db
 .DS_Store
+
+# dinfree
+result/

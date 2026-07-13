@@ -10,7 +10,7 @@ CONCURRENCY_LEVELS = [1, 5, 10, 20, 50, 100, 150, 200]
 TEST_PROMPT = "안녕하세요. 간단히 인사해주세요."
 
 # 모델 이름
-TEXT_MODEL_NAME = "text"
+TEXT_MODEL_NAME = "nvidia/Gemma-4-26B-A4B-NVFP4" #"qwen3.6-35b" # "text"
 
 # 타임아웃 설정 (초)
 REQUEST_TIMEOUT = 120
