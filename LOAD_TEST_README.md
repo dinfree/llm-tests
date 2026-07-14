@@ -33,6 +33,16 @@ pip install -r requirements.txt
 
 ## 사용 방법
 
+### 실행 시 입력 흐름
+프로그램을 실행하면 가장 먼저 아래 순서로 입력을 받습니다.
+
+1. **테스트 서버 주소** 입력 (`.env`의 `BASE_URL`이 있으면 기본값으로 제시되며, Enter만 누르면 그 값을 사용)
+2. 입력한 서버 주소의 `/v1/models` 엔드포인트를 조회해 **사용 가능한 모델 목록**을 확인
+   - 모델이 1개면 자동으로 해당 모델을 사용
+   - 모델이 여러 개면 번호를 보여주고 사용할 모델을 선택받음
+
+이후 아래 옵션에 따라 지정된 동시성 수준으로 테스트를 진행합니다. (모델명은 더 이상 `load_test_config.py`에 고정하지 않습니다.)
+
 ### 기본 실행
 기본 설정(동시성 1, 5, 10, 20, 50, 100, 150, 200)으로 전체 테스트를 실행합니다:
 
@@ -89,14 +99,15 @@ python load_test.py --help
 ```
 
 ### 결과 파일
-테스트 완료 후 `result/` 디렉토리에 타임스탬프 파일이 생성됩니다:
+테스트 완료 후 `result/` 디렉토리에 `년월일_모델명.txt` 형식의 파일이 생성됩니다. 같은 날 같은 모델로 재실행하면 `_01`, `_02`와 같이 번호가 붙어 기존 파일을 덮어쓰지 않습니다:
 
 ```
-result/load_test_20260401_225404.txt
+result/20260401_nvidia_Gemma-4-26B-A4B-NVFP4.txt
+result/20260401_nvidia_Gemma-4-26B-A4B-NVFP4_01.txt
 ```
 
 파일 내용:
-1. **테스트 개요**: 시간, 소요 시간, 동시성 수준, 모델명
+1. **테스트 개요**: 시간, 소요 시간, 테스트 서버 주소, 동시성 수준, 모델명
 2. **메인 테이블**: 모든 메트릭을 컬럼 형식으로 정리
 3. **아스키 차트**: TTFT와 TPS의 시각적 추이
 4. **상세 통계**: 동시성별 최소/최대/표준편차 등
@@ -173,7 +184,7 @@ python load_test.py --quick --prompt "Write a comprehensive essay on artificial 
 
 ## 제한사항
 
-- **텍스트 모델만 지원**: 현재 텍스트 API만 부하 테스트 가능 (Vision/Embedding은 `simple_model_test.py` 참고)
+- **텍스트 모델만 지원**: 현재 텍스트 API만 부하 테스트 가능 (Vision/Embedding은 `simple_test.py` 참고)
 - **단일 프롬프트**: 각 동시성 수준에서 동일한 프롬프트로 테스트
 - **로컬 실행**: 클라이언트 머신에서 실행되므로 네트워크 지연 포함
 
@@ -200,12 +211,12 @@ load_test_config.py       # 설정 및 상수
 load_test_utils.py        # 메트릭 수집, 통계, 출력 유틸리티
 LOAD_TEST_README.md       # 이 파일
 result/                   # 테스트 결과 파일 저장 디렉토리
-  └─ load_test_*.txt      # 타임스탬프 결과 파일
+  └─ YYYYMMDD_모델명.txt  # 날짜_모델명 결과 파일 (중복 시 _01, _02 ...)
 ```
 
 ## 기타 문서
 
-- `simple_model_test.py`: 단일 모델 테스트 (Text, Vision, Embedding/RAG)
+- `simple_test.py`: 단일 모델 테스트 (Text, Vision, Embedding/RAG)
 - `README.md`: 프로젝트 개요
 - `PRD.md`: 제품 요구사항 문서
 

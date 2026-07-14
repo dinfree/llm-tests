@@ -11,6 +11,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 
 from load_test_config import LoadTestConfig, CONCURRENCY_LEVELS
 from load_test_utils import (
@@ -38,10 +39,50 @@ def get_required_env(key: str) -> str:
     return value
 
 
-def create_chat_model(model_name: str) -> ChatOpenAI:
+def ask_server_address() -> str:
+    """테스트 서버 주소(BASE_URL)를 입력받는다. .env 값을 기본값으로 제시한다."""
+    default_url = os.getenv("BASE_URL", "").strip()
+    label = (
+        f"테스트 서버 주소를 입력하세요 (Enter: {default_url}): "
+        if default_url
+        else "테스트 서버 주소를 입력하세요: "
+    )
+
+    while True:
+        value = input(label).strip()
+        if value:
+            return value
+        if default_url:
+            return default_url
+        print("서버 주소를 입력해 주세요.")
+
+
+def query_available_models(api_key: str, base_url: str) -> list[str]:
+    """서버의 /models 엔드포인트를 조회해 사용 가능한 모델 id 목록을 반환한다."""
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.models.list()
+    return [model.id for model in response.data]
+
+
+def select_model_name(model_ids: list[str]) -> str:
+    """조회된 모델 목록에서 사용할 모델명을 결정한다(1개면 자동 사용, 여러 개면 선택받는다)."""
+    if len(model_ids) == 1:
+        print(f"사용 모델: {model_ids[0]}")
+        return model_ids[0]
+
+    print("\n사용 가능한 모델 목록:")
+    for idx, model_id in enumerate(model_ids, start=1):
+        print(f"  {idx}. {model_id}")
+
+    while True:
+        choice = input("사용할 모델 번호를 선택하세요: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(model_ids):
+            return model_ids[int(choice) - 1]
+        print("올바른 번호를 입력해 주세요.")
+
+
+def create_chat_model(model_name: str, api_key: str, base_url: str) -> ChatOpenAI:
     """텍스트 테스트에 사용하는 Chat 모델 클라이언트를 생성한다."""
-    api_key = get_required_env("API_KEY")
-    base_url = get_required_env("BASE_URL")
     return ChatOpenAI(
         model=model_name,
         api_key=api_key,
@@ -270,19 +311,15 @@ def parse_args() -> LoadTestConfig:
     return config
 
 
-def run_load_test(config: LoadTestConfig) -> None:
+def run_load_test(config: LoadTestConfig, api_key: str, base_url: str) -> None:
     """부하 테스트를 실행한다."""
     print("\n" + "=" * 100)
     print("LLM Proxy 부하 테스트 시작")
     print("=" * 100 + "\n")
 
-    try:
-        llm = create_chat_model(config.model_name)
-    except ConfigError as e:
-        print(f"설정 오류: {e}")
-        return
+    llm = create_chat_model(config.model_name, api_key, base_url)
 
-    formatter = ResultFormatter(config.result_dir, config.result_filename_prefix)
+    formatter = ResultFormatter(config.result_dir, config.model_name)
     all_metrics: list[ConcurrencyMetrics] = []
     test_start_time = time.perf_counter()
 
@@ -333,6 +370,7 @@ def run_load_test(config: LoadTestConfig) -> None:
     test_overview = (
         f"테스트 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"테스트 소요 시간: {test_end_time - test_start_time:.2f}초\n"
+        f"테스트 서버: {base_url}\n"
         f"동시성 수준: {config.concurrency_levels}\n"
         f"테스트 프롬프트: {config.test_prompt}\n"
         f"모델: {config.model_name}"
@@ -347,7 +385,28 @@ def run_load_test(config: LoadTestConfig) -> None:
 def main() -> None:
     """메인 진입점."""
     config = parse_args()
-    run_load_test(config)
+
+    try:
+        api_key = get_required_env("API_KEY")
+    except ConfigError as e:
+        print(f"설정 오류: {e}")
+        return
+
+    base_url = ask_server_address()
+
+    try:
+        model_ids = query_available_models(api_key, base_url)
+    except Exception as e:
+        print(f"모델 목록 조회 실패: {e}")
+        return
+
+    if not model_ids:
+        print("서버에서 사용 가능한 모델을 찾을 수 없습니다.")
+        return
+
+    config.model_name = select_model_name(model_ids)
+
+    run_load_test(config, api_key, base_url)
 
 
 if __name__ == "__main__":

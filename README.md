@@ -20,15 +20,15 @@ API_KEY=your_api_key
 BASE_URL=http://your-proxy-host/v1
 ```
 
-모델명은 코드에서 아래와 같이 고정되어 있습니다.
-- text 테스트: `text`
-- vision 테스트: `vision`
-- embedding 테스트: `text-embedding-nomic-embed-text-v1.5`
-- RAG 답변 생성: `text`
+모델명은 더 이상 코드에 고정되어 있지 않습니다. 프로그램 실행 시 아래 순서로 결정됩니다.
+1. 서버 주소 입력 (`.env`의 `BASE_URL`이 있으면 기본값으로 제시, Enter로 사용)
+2. 입력한 서버의 `/v1/models`를 조회해 사용 가능한 모델 목록 확인
+   - 모델이 1개면 text/vision/embedding 테스트 모두 그 모델을 사용
+   - 여러 개면 text/RAG 응답용, vision용, embedding용 모델을 각각 선택
 
 ## 4) 실행
 ```bash
-python main.py
+python simple_test.py
 ```
 
 ## 5) 메뉴
@@ -51,44 +51,50 @@ python main.py
 
 ## 8) 소스 구조와 함수 호출 관계
 
-프로그램의 진입점은 `main()`이며, 메뉴 선택에 따라 각 테스트 함수가 분기 호출됩니다.
+프로그램의 진입점은 `main()`이며, 서버 주소 입력과 모델 조회를 마친 뒤 메뉴 선택에 따라 각 테스트 함수가 분기 호출됩니다.
 
 ```mermaid
 flowchart TD
-  A[main] --> B[print_menu]
+  A[main] --> S1[ask_server_address]
+  S1 --> S2[query_available_models]
+  S2 --> S3[resolve_model_names]
+  S3 --> B[print_menu]
   A --> C[ask_input 메뉴 선택]
   C -->|1| T[run_text_test]
   C -->|2| V[run_vision_test]
   C -->|3| E[run_embedding_test]
   C -->|4| X[종료]
 
-  T --> T1[create_chat_model text]
+  T --> T1[create_chat_model text_model_name]
   T --> T2[stream_response]
   T2 --> T3[_extract_text / _extract_usage]
   T --> T4[print_metrics]
 
   V --> V0[sample.jpg 확인]
   V --> V1[encode_image_to_data_url]
-  V --> V2[create_chat_model vision]
+  V --> V2[create_chat_model vision_model_name]
   V --> V3[stream_response]
   V --> V4[print_metrics]
 
   E --> E1[load_documents txt or pdf]
   E --> E2[RecursiveCharacterTextSplitter]
-  E --> E3[create_embeddings_model]
+  E --> E3[create_embeddings_model embedding_model_name]
   E --> E4[FAISS.from_documents]
   E4 --> E5[retriever.invoke]
-  E --> E6[create_chat_model text]
+  E --> E6[create_chat_model text_model_name]
   E --> E7[stream_response]
   E --> E8[print_metrics]
 
-  T1 --> ENV[get_required_env API_KEY BASE_URL]
+  S1 --> ENV[get_required_env API_KEY]
+  T1 --> ENV
   V2 --> ENV
   E3 --> ENV
 ```
 
 핵심 유틸 함수 역할:
 - `get_required_env`: 필수 환경 변수 검증
+- `ask_server_address`: 서버 주소 입력(BASE_URL, `.env` 값을 기본값으로 제시)
+- `query_available_models` / `select_model_name` / `resolve_model_names`: 서버의 `/v1/models` 조회 및 역할별 모델 결정
 - `ask_input`: 공통 사용자 입력 처리
 - `stream_response`: 스트리밍 출력 + TTFT/TPS 측정
 - `print_metrics`: 토큰/성능 메트릭 출력
@@ -101,6 +107,12 @@ flowchart TD
 +--------------------+
 |       main         |
 +--------------------+
+          |
+          v
++---------------------------------------------+
+| ask_server_address -> query_available_models |
+|   -> resolve_model_names (select_model_name) |
++---------------------------------------------+
           |
           v
 +--------------------+      +--------------------------+
@@ -127,11 +139,11 @@ flowchart TD
 |                   | |                   | | print_metrics        |
 +-------------------+ +-------------------+ +----------------------+
 
-공통 의존(환경 변수)
-+------------------------------+
-| get_required_env(API_KEY)    |
-| get_required_env(BASE_URL)   |
-+------------------------------+
+공통 의존
++--------------------------------------+
+| get_required_env(API_KEY) - .env     |
+| ask_server_address() - 서버 주소 입력 |
++--------------------------------------+
         ^               ^
         |               |
   create_chat_model  create_embeddings_model
@@ -143,7 +155,8 @@ flowchart TD
 
 ```text
 +--------------------- LLM Tests CLI ---------------------+
-| main -> print_menu -> ask_input(메뉴)                   |
+| main -> ask_server_address -> query_available_models     |
+|      -> resolve_model_names -> print_menu -> ask_input   |
 +---------------------------------------------------------+
                  |1                     |2                     |3
                  v                      v                      v
@@ -160,7 +173,7 @@ flowchart TD
       |                  |    |                   |    | print_metrics        |
       +------------------+    +-------------------+    +----------------------+
 
-공통 의존: get_required_env(API_KEY, BASE_URL)
+공통 의존: get_required_env(API_KEY), ask_server_address(BASE_URL), query_available_models
 공통 출력: stream_response -> _extract_text/_extract_usage -> print_metrics
 ```
 

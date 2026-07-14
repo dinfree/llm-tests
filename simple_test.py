@@ -11,6 +11,7 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from openai import OpenAI
 
 """OpenAI 호환 프록시를 대상으로 text/vision/embedding(RAG) 테스트를 수행하는 CLI."""
 
@@ -18,11 +19,6 @@ load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
 SAMPLE_IMAGE_PATH = ROOT_DIR / "sample.jpg"
-#TEXT_MODEL_NAME = "text"
-#VISION_MODEL_NAME = "vision"
-TEXT_MODEL_NAME = "nvidia/Gemma-4-26B-A4B-NVFP4" #"qwen3.6-35b"
-VISION_MODEL_NAME = "nvidia/Gemma-4-26B-A4B-NVFP4" #"qwen3.6-35b"
-EMBEDDING_MODEL_NAME = "text-embedding-nomic-embed-text-v1.5"
 
 
 class ConfigError(Exception):
@@ -50,11 +46,67 @@ def ask_input(label: str, allow_empty: bool = False) -> str:
         print("값을 입력해 주세요.")
 
 
-def create_chat_model(model_name: str) -> ChatOpenAI:
+def ask_server_address() -> str:
+    """테스트 서버 주소(BASE_URL)를 입력받는다. .env 값을 기본값으로 제시한다."""
+
+    default_url = os.getenv("BASE_URL", "").strip()
+    label = (
+        f"테스트 서버 주소를 입력하세요 (Enter: {default_url}): "
+        if default_url
+        else "테스트 서버 주소를 입력하세요: "
+    )
+
+    while True:
+        value = input(label).strip()
+        if value:
+            return value
+        if default_url:
+            return default_url
+        print("서버 주소를 입력해 주세요.")
+
+
+def query_available_models(api_key: str, base_url: str) -> list[str]:
+    """서버의 /models 엔드포인트를 조회해 사용 가능한 모델 id 목록을 반환한다."""
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.models.list()
+    return [model.id for model in response.data]
+
+
+def select_model_name(model_ids: list[str], role_label: str) -> str:
+    """조회된 모델 목록에서 특정 용도(role_label)에 사용할 모델명을 결정한다."""
+
+    if len(model_ids) == 1:
+        print(f"[{role_label}] 사용 모델: {model_ids[0]}")
+        return model_ids[0]
+
+    print(f"\n[{role_label}] 사용 가능한 모델 목록:")
+    for idx, model_id in enumerate(model_ids, start=1):
+        print(f"  {idx}. {model_id}")
+
+    while True:
+        choice = input(f"[{role_label}] 사용할 모델 번호를 선택하세요: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(model_ids):
+            return model_ids[int(choice) - 1]
+        print("올바른 번호를 입력해 주세요.")
+
+
+def resolve_model_names(model_ids: list[str]) -> tuple[str, str, str]:
+    """서버가 제공하는 모델 목록에서 텍스트/비전/임베딩용 모델명을 결정한다."""
+
+    if len(model_ids) == 1:
+        print(f"사용 모델: {model_ids[0]} (텍스트/비전/임베딩 공통)")
+        return model_ids[0], model_ids[0], model_ids[0]
+
+    text_model_name = select_model_name(model_ids, "텍스트/RAG 응답")
+    vision_model_name = select_model_name(model_ids, "비전(이미지)")
+    embedding_model_name = select_model_name(model_ids, "임베딩")
+    return text_model_name, vision_model_name, embedding_model_name
+
+
+def create_chat_model(model_name: str, api_key: str, base_url: str) -> ChatOpenAI:
     """텍스트/비전 테스트에 사용하는 Chat 모델 클라이언트를 생성한다."""
 
-    api_key = get_required_env("API_KEY")
-    base_url = get_required_env("BASE_URL")
     return ChatOpenAI(
         model=model_name,
         api_key=api_key,
@@ -64,11 +116,9 @@ def create_chat_model(model_name: str) -> ChatOpenAI:
     )
 
 
-def create_embeddings_model(model_name: str) -> OpenAIEmbeddings:
+def create_embeddings_model(model_name: str, api_key: str, base_url: str) -> OpenAIEmbeddings:
     """RAG 임베딩 생성에 사용하는 임베딩 클라이언트를 생성한다."""
 
-    api_key = get_required_env("API_KEY")
-    base_url = get_required_env("BASE_URL")
     return OpenAIEmbeddings(
         model=model_name,
         api_key=api_key,
@@ -208,18 +258,18 @@ def print_metrics(metrics: dict[str, float | int | None]) -> None:
     print(f"- TPS: {tps:.2f}")
 
 
-def run_text_test() -> None:
+def run_text_test(model_name: str, api_key: str, base_url: str) -> None:
     """메뉴 1: 텍스트 모델 단일 프롬프트 테스트."""
 
     prompt = ask_input("프롬프트를 입력하세요: ")
 
-    llm = create_chat_model(TEXT_MODEL_NAME)
+    llm = create_chat_model(model_name, api_key, base_url)
     messages = [HumanMessage(content=prompt)]
     metrics = stream_response(llm, messages)
     print_metrics(metrics)
 
 
-def run_vision_test() -> None:
+def run_vision_test(model_name: str, api_key: str, base_url: str) -> None:
     """메뉴 2: sample.jpg + 프롬프트로 비전 모델 테스트."""
 
     if not SAMPLE_IMAGE_PATH.exists():
@@ -229,7 +279,7 @@ def run_vision_test() -> None:
     prompt = ask_input("이미지에 대한 프롬프트를 입력하세요: ")
 
     image_data_url = encode_image_to_data_url(SAMPLE_IMAGE_PATH)
-    llm = create_chat_model(VISION_MODEL_NAME)
+    llm = create_chat_model(model_name, api_key, base_url)
 
     messages = [
         HumanMessage(
@@ -284,7 +334,9 @@ def reciprocal_rank_fusion(rank_lists: list[list[Any]], limit: int = 6, rrf_k: i
     return [docs_by_key[key] for key in fused_keys[:limit]]
 
 
-def run_embedding_test() -> None:
+def run_embedding_test(
+    text_model_name: str, embedding_model_name: str, api_key: str, base_url: str
+) -> None:
     """메뉴 3: 문서 임베딩 + FAISS 검색 기반 RAG 질의응답 테스트."""
 
     file_name = ask_input("첨부할 파일명을 입력하세요 (예: sample.txt, sample.pdf): ")
@@ -330,7 +382,7 @@ def run_embedding_test() -> None:
         print("문서에서 처리할 텍스트를 찾을 수 없습니다.")
         return
 
-    embeddings = create_embeddings_model(EMBEDDING_MODEL_NAME)
+    embeddings = create_embeddings_model(embedding_model_name, api_key, base_url)
     # 문서 청크를 벡터화해 FAISS 인덱스를 구성한다.
     vector_store = FAISS.from_documents(split_docs, embeddings)
 
@@ -357,7 +409,7 @@ def run_embedding_test() -> None:
         print("검색된 문맥이 없어 답변을 생성할 수 없습니다.")
         return
 
-    llm = create_chat_model(TEXT_MODEL_NAME)
+    llm = create_chat_model(text_model_name, api_key, base_url)
     messages = [
         SystemMessage(
             content=(
@@ -390,9 +442,29 @@ def print_menu() -> None:
 
 
 def main() -> None:
-    """메뉴 루프를 실행하며 선택한 테스트를 호출한다."""
+    """서버/모델을 확인한 뒤 메뉴 루프를 실행하며 선택한 테스트를 호출한다."""
 
     print("LLM 테스트 프로그램을 시작합니다.")
+
+    try:
+        api_key = get_required_env("API_KEY")
+    except ConfigError as e:
+        print(f"설정 오류: {e}")
+        return
+
+    base_url = ask_server_address()
+
+    try:
+        model_ids = query_available_models(api_key, base_url)
+    except Exception as e:
+        print(f"모델 목록 조회 실패: {e}")
+        return
+
+    if not model_ids:
+        print("서버에서 사용 가능한 모델을 찾을 수 없습니다.")
+        return
+
+    text_model_name, vision_model_name, embedding_model_name = resolve_model_names(model_ids)
 
     while True:
         try:
@@ -400,11 +472,11 @@ def main() -> None:
             choice = ask_input("메뉴 번호를 선택하세요: ")
 
             if choice == "1":
-                run_text_test()
+                run_text_test(text_model_name, api_key, base_url)
             elif choice == "2":
-                run_vision_test()
+                run_vision_test(vision_model_name, api_key, base_url)
             elif choice == "3":
-                run_embedding_test()
+                run_embedding_test(text_model_name, embedding_model_name, api_key, base_url)
             elif choice == "4":
                 print("프로그램을 종료합니다.")
                 break

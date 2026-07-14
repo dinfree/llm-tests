@@ -1,5 +1,6 @@
 """부하 테스트 유틸리티: 메트릭 수집, 통계, 출력."""
 
+import re
 import statistics
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -101,15 +102,27 @@ class ConcurrencyMetrics:
 class ResultFormatter:
     """테스트 결과를 콘솔 및 파일에 출력한다."""
 
-    def __init__(self, result_dir: str, filename_prefix: str):
+    def __init__(self, result_dir: str, model_name: str):
         self.result_dir = Path(result_dir)
         self.result_dir.mkdir(parents=True, exist_ok=True)
-        self.filename_prefix = filename_prefix
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.model_name = model_name
+        self.date_str = datetime.now().strftime("%Y%m%d")
 
     def get_result_filepath(self) -> Path:
-        """결과 파일 경로를 반환한다."""
-        return self.result_dir / f"{self.filename_prefix}_{self.timestamp}.txt"
+        """결과 파일 경로를 반환한다(년월일_모델명.txt, 중복 시 _01, _02 ... 부여)."""
+        safe_model_name = re.sub(r"[^A-Za-z0-9._-]+", "_", self.model_name).strip("_") or "model"
+        base_name = f"{self.date_str}_{safe_model_name}"
+
+        candidate = self.result_dir / f"{base_name}.txt"
+        if not candidate.exists():
+            return candidate
+
+        suffix = 1
+        while True:
+            candidate = self.result_dir / f"{base_name}_{suffix:02d}.txt"
+            if not candidate.exists():
+                return candidate
+            suffix += 1
 
     def format_table_header(self) -> str:
         """테이블 헤더를 반환한다."""
