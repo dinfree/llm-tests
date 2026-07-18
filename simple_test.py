@@ -20,6 +20,8 @@ load_dotenv()
 ROOT_DIR = Path(__file__).resolve().parent
 SAMPLE_IMAGE_PATH = ROOT_DIR / "sample.jpg"
 
+# 임베딩 모델 테스트시 필요한 일반 LLM 모델 서버
+RAG_TEXT_SERVER = "http://169.254.63.162:8080/v1"
 
 class ConfigError(Exception):
     """필수 설정값(.env)이 누락되었을 때 발생하는 예외."""
@@ -409,7 +411,8 @@ def run_embedding_test(
         print("검색된 문맥이 없어 답변을 생성할 수 없습니다.")
         return
 
-    llm = create_chat_model(text_model_name, api_key, base_url)
+    # llm = create_chat_model(text_model_name, api_key, base_url)
+    llm = create_chat_model("text", api_key, RAG_TEXT_SERVER)
     messages = [
         SystemMessage(
             content=(
